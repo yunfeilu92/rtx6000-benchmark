@@ -66,8 +66,8 @@ fi
 
 echo "========================================="
 echo "Step 2: Training on 8x RTX PRO Server 6000"
-echo "Precision: BF16-mixed (Blackwell Tensor Core 252 TFLOPS)"
-echo "Batch size: 256 (32 per GPU, ~78% VRAM usage)"
+echo "Precision: FP32 | FPN upsample: nearest (4x speedup over linear)"
+echo "Batch size: 256 (32 per GPU)"
 echo "Start: $(date)"
 echo "========================================="
 
@@ -83,6 +83,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python run_training.py \
     cache.use_cache_without_dataset=true \
     data_loader.params.batch_size=256 \
     data_loader.params.num_workers=20 \
+    data_loader.params.pin_memory=true \
     lr=1e-3 epochs=25 warmup_epochs=3 weight_decay=0.0001 \
     lightning.trainer.params.accelerator=gpu \
     lightning.trainer.params.devices=8 \

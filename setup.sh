@@ -114,6 +114,12 @@ sed -i 's|x_speed_limit\[~polygon_has_speed_limit\] = self.unknown_speed_emb.wei
 sed -i 's|x_features = torch.zeros(bs, n, 256, device=device)|x_features = torch.zeros(bs, n, 256, device=device, dtype=x_valid.dtype)|' src/models/pluto/layers/embedding.py
 sed -i 's|res = torch.zeros(bs, n, self.encoder_channel, device=device)|res = torch.zeros(bs, n, self.encoder_channel, device=device, dtype=x_features_valid.dtype)|' src/models/pluto/layers/embedding.py
 
+# Patch 6: FPN upsample linear -> nearest (4x speedup)
+# F.interpolate(mode="linear") is pure memory-bandwidth op, doesn't use Tensor Cores.
+# On H200: 89.4% GPU time. Changing to "nearest" gives 4-8x training speedup.
+sed -i 's/mode="linear"/mode="nearest"/' src/models/pluto/layers/embedding.py
+sed -i '/align_corners/d' src/models/pluto/layers/embedding.py
+
 echo "=== PLUTO_DONE ==="
 
 # 12. Create data directories on NVMe (14TB available on g7e.48xlarge)
