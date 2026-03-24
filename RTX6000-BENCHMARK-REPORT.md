@@ -104,17 +104,24 @@ Adapted from [h200-benchmark](https://github.com/yunfeilu92/h200-benchmark) for 
 | Power Draw | ~248W / 600W (41% TDP) |
 | Temperature | 42-43°C |
 
-### Loss Convergence (FPN nearest, 25 epochs, in progress)
+### Loss Convergence (FPN nearest, 25 epochs, COMPLETED)
 
 | Epoch | Val Loss | Trend |
 |---|---|---|
 | 3 | 4.6185 | |
 | 4 | 3.7465 | ↓ |
 | 5 | 3.5641 | ↓ |
-| 6 | 3.4671 | ↓ |
 | 7 | 3.2991 | ↓ |
+| 14 | 2.9344 | ↓ |
+| 19 | 2.8274 | ↓ |
+| 21 | 2.8384 | ↑ minor |
+| **22** | **2.8176** | **↓ best** |
+| 23 | 2.8269 | ↑ |
+| 24 | 2.8349 | ↑ |
 
-Loss is steadily converging. Training is ongoing — will update with final results.
+**Best val_loss = 2.8176 (epoch 22)** — better than linear mode's 2.9001 (epoch 19, incomplete 20/25 run).
+
+The `nearest` interpolation mode converges well despite lower interpolation precision, likely because the FPN feature maps are already discrete representations where sub-pixel accuracy provides diminishing returns.
 
 ### Optimization Impact Summary
 
@@ -239,6 +246,35 @@ t=19s: COMPUTE      SM=100% rx=3     tx=1     — Pure compute
 4. **CPU→GPU transfer of nuPlan's 50+ nested tensors is the true bottleneck**
 
 **Average power: ~248W (41% TDP)**
+
+#### 8-GPU DDP Profiling (120s dmon, all 8 GPUs, 960 samples)
+
+Full 8-GPU profiling after training completed (nearest, FP32, batch=256):
+
+| Phase | Time % | Avg SM | Avg Power | Description |
+|---|---|---|---|---|
+| **IDLE** | **37.0%** | 3% | 146W | All GPUs waiting — DataLoader can't feed 8 GPUs |
+| **COMPUTE** | **31.0%** | 96% | 236W | Actual forward + backward |
+| **DATA_XFER** | **22.3%** | 72% | 244W | CPU→GPU batch transfer (PCIe RX ~4.7 GB/s) |
+| TRANSITION | 6.5% | 44% | 239W | Between phases |
+| DDP_SYNC | 3.2% | 61% | 251W | AllReduce gradient sync |
+
+Per-GPU averages (120 samples each):
+
+| GPU | Avg SM | Avg Power | Avg PCIe RX | Avg PCIe TX |
+|---|---|---|---|---|
+| 0 | 51% | 201W | 1,181 MB/s | 114 MB/s |
+| 1 | 51% | 206W | 907 MB/s | 136 MB/s |
+| 2 | 50% | 205W | 1,142 MB/s | 104 MB/s |
+| 3 | 50% | 204W | 1,049 MB/s | 118 MB/s |
+| 4 | 53% | 203W | 1,046 MB/s | 98 MB/s |
+| 5 | 55% | 209W | 915 MB/s | 155 MB/s |
+| 6 | 52% | 206W | 1,041 MB/s | 134 MB/s |
+| 7 | 51% | 209W | 1,048 MB/s | 128 MB/s |
+
+**Critical finding: 19.2% of the time, ALL 8 GPUs are simultaneously idle (SM < 15%).** This proves the bottleneck is global (DataLoader/data transfer), not per-GPU (DDP load imbalance).
+
+**Root cause:** 8 GPUs finish compute at roughly the same time (DDP barrier), then all 8 request their next batch simultaneously. The DataLoader + CPU→GPU transfer pipeline cannot serve 8 GPUs in parallel fast enough, creating a synchronized stall.
 
 The sawtooth pattern confirms: the 4.1M parameter model finishes compute quickly, then waits for CPU→GPU data transfer. DDP communication overhead is minimal. The fundamental limitation is the complex nested tensor structure of nuPlan batches transferring over PCIe.
 
