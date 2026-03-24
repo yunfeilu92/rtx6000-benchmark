@@ -191,7 +191,23 @@ Batch=256 is the sweet spot. Batch=512 causes memory pressure that kills through
 
 ### GPU Utilization Deep Dive (8-GPU, nearest, batch=256, FP32)
 
-30-second monitoring with 10 samples at 3-second intervals:
+**GPU utilization is sawtooth-shaped**, not steady. 30 samples at 1-second intervals on GPU 0:
+
+```
+13 44 13 100 14 9 14 7 11 13 31 99 53 99 100 20 99 99 100 99 0 17 2 0 10 14 12 27 12 37
+```
+
+Three-phase cycle repeating every ~10 seconds:
+
+| Phase | GPU Util | Duration | What's Happening |
+|---|---|---|---|
+| **Compute** | 99-100% | ~3-5s | Forward + backward pass |
+| **Idle/Wait** | 0-14% | ~5-8s | DDP AllReduce sync + CPU→GPU data transfer |
+| **Transition** | 20-50% | ~1-2s | Some GPUs done, waiting for stragglers |
+
+**Average utilization: ~38%** — GPU is idle more than half the time, waiting for DDP sync and data transfer.
+
+Separate 10-sample monitoring at 3-second intervals (captures broader view):
 
 | Phase | GPU Util | Power | What's Happening |
 |---|---|---|---|
@@ -199,9 +215,9 @@ Batch=256 is the sweet spot. Batch=512 causes memory pressure that kills through
 | DDP AllReduce | 0-7% | 220-240W | NCCL sync over PCIe (power still high) |
 | Data transfer | 10-15% | 260-280W | CPU→GPU batch loading |
 
-**Average: 62% GPU utilization, 248W power (41% TDP)**
+**Average power: ~248W (41% TDP)**
 
-The 4.1M parameter model cannot fully saturate 8x RTX PRO 6000 GPUs. Power draw at 41% TDP indicates significant headroom for larger models.
+The sawtooth pattern confirms: the 4.1M parameter model finishes compute quickly, then waits for PCIe-based DDP communication and CPU→GPU data transfer. This is the fundamental limitation of small models on high-end GPUs without NVLink.
 
 ### Optimization Assessment
 
