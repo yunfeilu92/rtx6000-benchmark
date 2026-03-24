@@ -197,27 +197,50 @@ Batch=256 is the sweet spot. Batch=512 causes memory pressure that kills through
 13 44 13 100 14 9 14 7 11 13 31 99 53 99 100 20 99 99 100 99 0 17 2 0 10 14 12 27 12 37
 ```
 
-Three-phase cycle repeating every ~10 seconds:
+#### PCIe Traffic Analysis (nvidia-smi dmon, 60 samples @ 1s)
 
-| Phase | GPU Util | Duration | What's Happening |
-|---|---|---|---|
-| **Compute** | 99-100% | ~3-5s | Forward + backward pass |
-| **Idle/Wait** | 0-14% | ~5-8s | DDP AllReduce sync + CPU→GPU data transfer |
-| **Transition** | 20-50% | ~1-2s | Some GPUs done, waiting for stragglers |
+Using PCIe RX/TX throughput to precisely classify what each GPU is doing:
 
-**Average utilization: ~38%** — GPU is idle more than half the time, waiting for DDP sync and data transfer.
+| Phase | Time % | Avg SM Util | PCIe Traffic | Avg Power |
+|---|---|---|---|---|
+| **Compute** | **52%** | 91% | ~50 MB/s (negligible) | 238W |
+| **Data Transfer (CPU→GPU)** | **23%** | 71%* | **RX 4,779 MB/s** | 262W |
+| **Idle/Wait** | **18%** | 8% | ~120 MB/s | 251W |
+| **DDP AllReduce** | **7%** | 55% | **TX 1,087 MB/s** | 261W |
 
-Separate 10-sample monitoring at 3-second intervals (captures broader view):
+*Data transfer shows high SM because compute overlaps with transfer in some samples.
 
-| Phase | GPU Util | Power | What's Happening |
-|---|---|---|---|
-| Compute burst | 85-100% | 230-280W | Forward + backward pass |
-| DDP AllReduce | 0-7% | 220-240W | NCCL sync over PCIe (power still high) |
-| Data transfer | 10-15% | 260-280W | CPU→GPU batch loading |
+**Key finding: Data Transfer is the #1 non-compute overhead (23%), NOT DDP sync (only 7%).**
+
+DDP AllReduce is fast because gradients are tiny (4.1M params = ~16MB), PCIe 5.0 handles it in <1 second. The real bottleneck is moving 256-sample batches of complex nuPlan features from CPU to GPU.
+
+#### One Complete Step Cycle (second-by-second)
+
+```
+t= 5s: IDLE         SM=2%   rx=11    tx=35    — Previous step done, waiting
+t= 7s: IDLE         SM=0%   rx=5     tx=4     — GPU completely idle
+t= 8s: DATA_XFER    SM=7%   rx=1632  tx=1     — New batch arriving from CPU
+t= 9s: DATA_XFER    SM=13%  rx=1812  tx=295   — Still transferring (GPU idle)
+t=10s: DATA_XFER    SM=2%   rx=1453  tx=293   — Still transferring (GPU idle)
+t=11s: DDP_SYNC     SM=10%  tx=296             — AllReduce gradient sync
+t=13s: DATA_XFER    SM=99%  rx=6404  tx=36    — Compute starts, still loading
+t=14s: DATA_XFER    SM=45%  rx=5742  tx=505   — Overlapped compute + transfer
+t=15s: DATA_XFER    SM=99%  rx=5805  tx=495   — Overlapped compute + transfer
+t=16s: DATA_XFER    SM=99%  rx=6408  tx=518   — Overlapped compute + transfer
+t=17s: DDP_SYNC     SM=99%  tx=1778            — Overlapped compute + sync
+t=18s: COMPUTE      SM=92%  rx=6     tx=2     — Pure compute
+t=19s: COMPUTE      SM=100% rx=3     tx=1     — Pure compute
+```
+
+**Observations:**
+1. **Data transfer happens in two waves**: first ~3s pure transfer (SM<15%, rx=1.5 GB/s), then ~4s overlapped with compute (SM=99%, rx=6 GB/s)
+2. **DDP AllReduce is only 7% of time** — gradient sync is NOT the bottleneck
+3. **18% pure idle** — GPU waiting for next batch to arrive
+4. **CPU→GPU transfer of nuPlan's 50+ nested tensors is the true bottleneck**
 
 **Average power: ~248W (41% TDP)**
 
-The sawtooth pattern confirms: the 4.1M parameter model finishes compute quickly, then waits for PCIe-based DDP communication and CPU→GPU data transfer. This is the fundamental limitation of small models on high-end GPUs without NVLink.
+The sawtooth pattern confirms: the 4.1M parameter model finishes compute quickly, then waits for CPU→GPU data transfer. DDP communication overhead is minimal. The fundamental limitation is the complex nested tensor structure of nuPlan batches transferring over PCIe.
 
 ### Optimization Assessment
 
