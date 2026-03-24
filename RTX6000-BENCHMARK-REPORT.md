@@ -54,7 +54,7 @@ Adapted from [h200-benchmark](https://github.com/yunfeilu92/h200-benchmark) for 
 - Model size: **4.1M parameters** (~16MB)
 - Dataset: nuPlan v1.1 (8,733 scenarios, 775K training samples)
 
-### Training Config
+### Final Training Config
 | Parameter | Value |
 |---|---|
 | Batch Size | 256 (32 per GPU) |
@@ -62,8 +62,10 @@ Adapted from [h200-benchmark](https://github.com/yunfeilu92/h200-benchmark) for 
 | Epochs | 25 |
 | Learning Rate | 1e-3 (Cosine + 3 epoch warmup) |
 | Precision | FP32 |
+| FPN Upsample | nearest (optimized from linear) |
 | Strategy | DDP (find_unused_parameters=false) |
 | DataLoader Workers | 20 |
+| pin_memory | True |
 
 ## Results
 
@@ -75,33 +77,61 @@ Adapted from [h200-benchmark](https://github.com/yunfeilu92/h200-benchmark) for 
 | Ray Workers | 40 |
 | Cache Size | ~460 GB |
 
-### Training (Step 2)
+### Training (Step 2) — Optimization Journey
 
-#### Batch Size = 64 (8 per GPU, FP32)
+#### Original: FPN linear, FP32, batch=64
 | Metric | Value |
 |---|---|
 | Epoch Time | **~22 min** |
-| Steps per Epoch | 1,515 |
-| Throughput | ~4,500 samples/sec |
-| GPU Utilization | 96-100% |
+| GPU Utilization | 96-100% (misleading — GPU busy-waiting on slow linear interpolate) |
 | VRAM Usage | ~25 GB / 95 GB (26%) |
-| Power Draw | ~135W / 600W (22%) |
-| Temperature | 30-32°C |
+| Power Draw | ~135W / 600W (22% TDP) |
 
-#### Batch Size = 256 (32 per GPU, FP32)
+#### After batch=256, FP32, linear
 | Metric | Value |
 |---|---|
 | Epoch Time | **~28 min** |
-| Steps per Epoch | 379 |
-| Throughput | ~4,600 samples/sec |
 | GPU Utilization | 100% |
 | VRAM Usage | ~65-91 GB / 95 GB (68-95%) |
-| Power Draw | ~100W / 600W (17%) |
-| Temperature | 30-32°C |
+| Power Draw | ~100W / 600W (17% TDP) |
+
+#### Final: FPN nearest, FP32, batch=256 (current run, in progress)
+| Metric | Value |
+|---|---|
+| Epoch Time | **~8 min** |
+| GPU Utilization | avg 62%, bursts 0-100% (real compute cycles) |
+| VRAM Usage | ~62-94 GB / 95 GB (65-98%) |
+| Power Draw | ~248W / 600W (41% TDP) |
+| Temperature | 42-43°C |
+
+### Loss Convergence (FPN nearest, 25 epochs, in progress)
+
+| Epoch | Val Loss | Trend |
+|---|---|---|
+| 3 | 4.6185 | |
+| 4 | 3.7465 | ↓ |
+| 5 | 3.5641 | ↓ |
+| 6 | 3.4671 | ↓ |
+| 7 | 3.2991 | ↓ |
+
+Loss is steadily converging. Training is ongoing — will update with final results.
+
+### Optimization Impact Summary
+
+| Configuration | Epoch Time | Power (TDP%) | Speedup |
+|---|---|---|---|
+| linear + FP32 + batch=64 | 22 min | 135W (22%) | 1x |
+| linear + FP32 + batch=256 | 28 min | 100W (17%) | 0.8x |
+| **nearest + FP32 + batch=256** | **8 min** | **248W (41%)** | **2.8x** |
+| nearest + BF16 + batch=256 | 7.2 min | 255W (43%) | 3.1x |
+| nearest + BF16 + batch=128 | 7.6 min | ~240W (40%) | 2.9x |
+| nearest + BF16 + batch=512 | >30 min | ~97W (16%) | OOM-level slow |
 
 ## Profiling Analysis
 
-Detailed profiling on single GPU, batch=256, FP32, 20 steps:
+### Before Optimization (FPN linear)
+
+Single GPU, batch=256, FP32, 20 steps:
 
 | Phase | Time per Step | Percentage |
 |---|---|---|
@@ -111,58 +141,96 @@ Detailed profiling on single GPU, batch=256, FP32, 20 steps:
 | **Backward pass** | **2.037s** | **54.3%** |
 | Optimizer step | 0.008s | 0.2% |
 | **Total** | **3.749s** | 100% |
-| **Throughput** | **68 samples/sec** | (single GPU) |
+| **Throughput** | **68 samples/sec** | |
 
-### Key Findings
+### After Optimization (FPN nearest)
 
-1. **Backward dominates (54%)** — PLUTO uses masked indexing, `grid_sample`, Neighborhood Attention, which have expensive backward ops
-2. **Forward is 37%** — as expected for a small model
-3. **Data transfer is 8.4%** — 0.32s to move 256 samples from CPU to GPU
-4. **Loss and optimizer are negligible** — model is tiny (4.1M params)
+Single GPU, batch=256, FP32, 20 steps:
 
-### Why BF16 Doesn't Help This Model
-
-We tested BF16-mixed precision and found **zero speedup** over FP32:
-- PLUTO's 4.1M parameters create small matrix operations that can't saturate Tensor Cores
-- Tensor Cores need large matmuls (dimensions >> 256) to achieve speedup
-- GPU is at 17% TDP in FP32 — it's not compute-bound
-- BF16 autocast overhead (dtype casting, GradScaler) cancels out any theoretical gain
-
-### Throughput Is Constant Across Batch Sizes
-
-| Batch Size | Epoch Time | Throughput |
+| Phase | Time per Step | Percentage |
 |---|---|---|
-| 64 | 22 min | ~4,500 samples/sec |
-| 256 | 28 min | ~4,600 samples/sec |
+| **Data transfer** | **0.284s** | **30.8%** |
+| Forward pass | 0.221s | 24.0% |
+| Loss compute | 0.003s | 0.3% |
+| Backward pass | 0.408s | 44.3% |
+| Optimizer step | 0.006s | 0.6% |
+| **Total** | **0.921s** | 100% |
+| **Throughput** | **278 samples/sec** | **4.1x faster** |
 
-Throughput barely changes because the bottleneck is DDP communication over PCIe (no NVLink, P2P disabled) and CPU-GPU data transfer, not GPU compute.
+### Key Finding: FPN Upsample Was the #1 Bottleneck
+
+`F.interpolate(mode="linear")` consumed the majority of GPU time:
+- Linear interpolation is a pure memory-bandwidth operation — does NOT use Tensor Cores
+- Forward: 1.385s → 0.221s (**6.3x faster**)
+- Backward: 2.037s → 0.408s (**5.0x faster**)
+- Same fix was discovered on H200 benchmark (89.4% GPU time on linear)
+
+After fixing upsample, the bottleneck shifted to **CPU→GPU data transfer (31%)**, because nuPlan batches contain 50+ nested tensors that transfer individually.
+
+### BF16 vs FP32 (after upsample fix)
+
+| Metric | FP32 | BF16-mixed |
+|---|---|---|
+| Forward | 0.221s | 0.165s (**25% faster**) |
+| Backward | 0.408s | 0.267s (**35% faster**) |
+| Total/step | 0.921s | 0.767s (**17% faster**) |
+| Throughput | 278 samp/sec | 334 samp/sec (**+20%**) |
+| VRAM | ~65-91 GB | 41.6 GB (**55% less**) |
+
+BF16 shows real speedup after the upsample fix because GPU compute is now a meaningful portion of step time. Before the fix, BF16 showed zero speedup (GPU was bottlenecked on linear interpolate which doesn't benefit from Tensor Cores).
+
+### 8-GPU Batch Size Sweep (BF16, nearest)
+
+| Batch | Epoch Time (3 epochs avg) | VRAM/GPU |
+|---|---|---|
+| 128 | **7.6 min** | ~32 GB (33%) |
+| **256** | **7.2 min** | ~65 GB (68%) |
+| 512 | >30 min (OOM-level) | ~96 GB (98%) |
+
+Batch=256 is the sweet spot. Batch=512 causes memory pressure that kills throughput.
+
+### GPU Utilization Deep Dive (8-GPU, nearest, batch=256, FP32)
+
+30-second monitoring with 10 samples at 3-second intervals:
+
+| Phase | GPU Util | Power | What's Happening |
+|---|---|---|---|
+| Compute burst | 85-100% | 230-280W | Forward + backward pass |
+| DDP AllReduce | 0-7% | 220-240W | NCCL sync over PCIe (power still high) |
+| Data transfer | 10-15% | 260-280W | CPU→GPU batch loading |
+
+**Average: 62% GPU utilization, 248W power (41% TDP)**
+
+The 4.1M parameter model cannot fully saturate 8x RTX PRO 6000 GPUs. Power draw at 41% TDP indicates significant headroom for larger models.
 
 ### Optimization Assessment
 
-| Optimization | Applicable? | Expected Impact |
+| Optimization | Tested? | Impact |
 |---|---|---|
-| torch.compile | Blocked — Triton segfaults on SM 12.0 | N/A |
-| pin_memory=True | Yes | 2-4% (reduce data transfer) |
-| BF16-mixed | Works but no speedup | 0% for small models |
-| Larger batch (512) | Works but throughput constant | ~0% |
-| Gradient accumulation | Adds overhead | Negative |
-| More workers (32) | Loading not bottleneck | ~0% |
-| CUDA Graphs | Blocked — dynamic shapes + SM 12.0 | N/A |
+| **FPN upsample nearest** | Yes | **4x single-GPU, 2.8x 8-GPU** |
+| pin_memory=True | Yes | Included in final config |
+| BF16-mixed | Yes | 20% faster after upsample fix |
+| torch.compile | Blocked | Triton segfaults on SM 12.0 ([#176426](https://github.com/pytorch/pytorch/issues/176426)) |
+| Larger batch (512) | Yes | OOM-level slow |
+| Gradient accumulation | Analyzed | Negative impact for small models |
+| CUDA Graphs | Blocked | Dynamic shapes + SM 12.0 incompatible |
+| Tensor packing in collate_fn | Not tested | Could reduce 31% data transfer overhead |
+| CUDA stream double-buffering | Not tested | Could overlap transfer with compute |
 
 ## Blackwell Compatibility Issues (Critical)
 
 ### 1. NCCL 2.26.2 Completely Broken
-PyTorch 2.7.0 ships NCCL 2.26.2 which **hangs indefinitely** on Blackwell during any collective operation (AllReduce, AllGather). Even single-GPU `dist.init_process_group()` hangs.
+PyTorch 2.7.0 ships NCCL 2.26.2 which **hangs indefinitely** on Blackwell during any collective operation.
 
 **Fix**: Use PyTorch >= 2.10.0 (ships NCCL 2.27.5).
 
 ### 2. cuBLAS Batched GEMM Crash
-cuBLAS 12.8.x crashes with `CUBLAS_STATUS_INVALID_VALUE` on `torch.bmm()`, `cublasSgemmStridedBatched`, and all batched GEMM ops. Affects **all precisions** (FP32/FP16/BF16).
+cuBLAS 12.8.x crashes with `CUBLAS_STATUS_INVALID_VALUE` on `torch.bmm()` and all batched GEMM ops. Affects **all precisions**.
 
 **Fix**: `pip install --force-reinstall --no-deps nvidia-cublas-cu12==12.9.1.4`
 
 ### 3. NCCL Socket Interface
-g7e instances use network interface `enp135s0`, not `eth0` or `ens5`. Setting `NCCL_SOCKET_IFNAME=eth0` causes "Bootstrap: no socket interface found".
+g7e uses `enp135s0`, not `eth0`/`ens5`. Wrong setting causes "Bootstrap: no socket interface found".
 
 **Fix**: `export NCCL_SOCKET_IFNAME=enp135s0`
 
@@ -174,24 +242,19 @@ export NCCL_NVLS_ENABLE=0     # NVLink SHARP causes hangs
 export NCCL_SOCKET_IFNAME=enp135s0
 ```
 
-### 5. BF16/FP16 Mixed Precision Dtype Mismatches
-PLUTO code has two types of dtype issues under autocast:
-1. `torch.zeros()` without dtype creates FP32 tensors that receive BF16 autocast outputs
-2. `nn.Embedding.weight` stays FP32 but is assigned into BF16 tensors
+### 5. BF16 Dtype Mismatches in PLUTO
+`torch.zeros()` without dtype + `nn.Embedding.weight` staying FP32 under autocast.
 
-**Fix**: `patch_pluto_bf16.sh` patches 3 files (6 locations):
-- `agent_encoder.py`: `torch.zeros()` dtype + `x_ego` cast
-- `map_encoder.py`: `torch.zeros()` dtype + `unknown_speed_emb.weight` cast
-- `embedding.py`: 2x `torch.zeros()` dtype
+**Fix**: `patch_pluto_bf16.sh` (6 locations across 3 files)
 
 ### 6. PLUTO Code Patches Required
-- Missing `__init__.py` in all `src/` subdirectories (Python 3.12 compat)
-- NATTEN 0.21.x removed `attn_drop` parameter
-- PyTorch 2.7+ removed `verbose` from `LRScheduler.__init__`
-- nuplan data directory structure needs symlinks
+- Missing `__init__.py` in `src/` subdirectories (Python 3.12)
+- NATTEN 0.21.x API change (`attn_drop` removed)
+- LRScheduler `verbose` param removed in PyTorch 2.7+
+- nuplan data directory symlinks needed
 
 ### 7. Triton / torch.compile Not Ready for SM 12.0
-[PyTorch issue #176426](https://github.com/pytorch/pytorch/issues/176426): Triton kernels with 2+ `tl.load()` calls segfault at runtime on SM 12.0. This blocks `torch.compile` and CUDA Graphs.
+[PyTorch #176426](https://github.com/pytorch/pytorch/issues/176426): Triton segfaults on SM 12.0.
 
 ## GPU Comparison
 
@@ -215,11 +278,9 @@ PLUTO code has two types of dtype issues under autocast:
 | Architecture | Ada Lovelace SM 8.9 | Blackwell SM 12.0 |
 | FP32 | 91.6 TFLOPS | 125 TFLOPS (+36%) |
 | BF16 Tensor | **362 TFLOPS** | 252 TFLOPS (L40S wins) |
-| FP8 Tensor | 733 TFLOPS | 504 TFLOPS (L40S wins) |
 | FP4 Tensor | N/A | 2,015 TFLOPS (exclusive) |
 | VRAM | 48 GB GDDR6 | 96 GB GDDR7 (2x) |
 | Memory BW | 864 GB/s | 1,600 GB/s (1.85x) |
-| MIG | No | Yes (4x 24GB) |
 | 8-GPU Price | $30.13/hr | $33.14/hr (+10%) |
 
 ### When to Use Which GPU
@@ -242,4 +303,5 @@ PLUTO code has two types of dtype issues under autocast:
 | `launch_instance.sh` | EC2 launch with auto AMI detection |
 | `patch_pluto_bf16.sh` | BF16 dtype patches for PLUTO model code |
 | `profile_direct.py` | Per-phase profiling script (forward/backward/data) |
+| `sweep_batch.sh` | Batch size sweep script |
 | `RTX6000-BENCHMARK-REPORT.md` | This report |
