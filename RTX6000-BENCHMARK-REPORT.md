@@ -331,6 +331,74 @@ export NCCL_SOCKET_IFNAME=enp135s0
 ### 7. Triton / torch.compile Not Ready for SM 12.0
 [PyTorch #176426](https://github.com/pytorch/pytorch/issues/176426): Triton segfaults on SM 12.0.
 
+## MapQR Benchmark (Second Algorithm)
+
+### Overview
+
+[MapQR](https://github.com/HXMap/MapQR) (ECCV 2024) — vectorized HD map construction for autonomous driving using ResNet50 backbone + deformable attention + temporal fusion. Trained on full nuScenes v1.0-trainval (28,160 training samples, 6 camera views, 850 scenes).
+
+Required 14 patches to port from CUDA 11.x/PyTorch 1.9 to Blackwell CUDA 12.8/PyTorch 2.7 (see [harryzsh/mapqr-g7e-benchmark](https://github.com/harryzsh/mapqr-g7e-benchmark) for patch details).
+
+### 8-GPU Training Results
+
+#### Batch=4/GPU (baseline, 24 epochs)
+
+| Metric | Value |
+|---|---|
+| Total batch size | 32 (4 × 8 GPUs) |
+| Epochs | 24 |
+| **Total training time** | **7h 52min** |
+| **Epoch time** | **~19.7 min** |
+| Step time | ~1.29s |
+| Throughput | **24.8 samples/sec** |
+| GPU memory | 15.8 GB / 96 GB (16%) |
+| GPU utilization | 30-98% |
+| Power draw | ~170W / 600W (28% TDP) |
+
+#### Batch=8/GPU (optimized, 3 epochs)
+
+| Metric | Value |
+|---|---|
+| Total batch size | 64 (8 × 8 GPUs) |
+| Step time | ~2.47s |
+| **Epoch time** | **~20 min** |
+| Throughput | **25.9 samples/sec** |
+| GPU memory | 31.7 GB / 96 GB (33%) |
+| Power draw | ~100W / 600W (17% TDP) |
+
+**Batch doubling provides negligible throughput gain (+4%).** Same pattern as PLUTO — small models can't saturate RTX PRO 6000.
+
+### MapQR Loss Convergence (batch=4, 24 epochs)
+
+| Epoch | Loss |
+|---|---|
+| 1 | 93.88 |
+| 3 | 58.89 |
+| 6 | 40.59 |
+| 9 | 29.51 |
+| 12 | 25.00 |
+| 15 | 20.70 |
+| 18 | 17.44 |
+| 21 | 13.83 |
+| 24 | 14.05 |
+
+### PLUTO vs MapQR Comparison
+
+| Metric | PLUTO | MapQR |
+|---|---|---|
+| Task | Path planning | HD map construction |
+| Model size | 4.1M params | ~25M params (ResNet50) |
+| Dataset | 775K samples (nuPlan) | 28K samples (nuScenes) |
+| Batch/step | 256 | 32 |
+| Step time | ~0.96s | ~1.29s |
+| **Throughput** | **4,600 samples/sec** | **24.8 samples/sec** |
+| Per-sample compute | 0.0004s | 0.32s |
+| GPU memory | 62-94 GB (65-98%) | 15.8 GB (16%) |
+| GPU utilization | 31% (8-GPU) | 30-98% |
+| Bottleneck | CPU→GPU data transfer (37% idle) | Model compute (deformable attention) |
+
+**Key insight:** PLUTO is data-transfer bound (tiny model, huge batches), MapQR is compute-bound (heavier model, small batches). Both are too small to fully utilize RTX PRO 6000's 96 GB / 600W capacity.
+
 ## GPU Comparison
 
 ### RTX PRO 6000 vs H200
